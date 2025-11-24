@@ -82,7 +82,7 @@ void scatterKernel(const uint32_t *d_in,
     int blockEnd   = blockStart + CHUNK_SIZE;
     if (blockEnd > n) blockEnd = n;
 
-    // Initialize per-block bucket counters
+    // Initialize per-block bucket counters cooperatively
     for (int b = tid; b < RADIX; b += blockDim.x) {
         localCount[b] = 0;
     }
@@ -90,16 +90,18 @@ void scatterKernel(const uint32_t *d_in,
 
     const unsigned int *blockOffsetBase = d_blockOffsets + blockId * RADIX;
 
-    // All threads scatter in parallel
-    for (int idx = blockStart + tid; idx < blockEnd; idx += blockDim.x) {
-        uint32_t v       = d_in[idx];
-        unsigned int buk = (v >> shift) & RADIX_MASK;
+    // To keep the pass STABLE, we must process elements in block order.
+    // Let a single thread (tid == 0) walk [blockStart, blockEnd) in order.
+    if (tid == 0) {
+        for (int idx = blockStart; idx < blockEnd; ++idx) {
+            uint32_t v       = d_in[idx];
+            unsigned int buk = (v >> shift) & RADIX_MASK;
 
-        // Reserve a slot within this block's range for this bucket
-        unsigned int offsetInBlock = atomicAdd(&localCount[buk], 1);
-        unsigned int pos           = blockOffsetBase[buk] + offsetInBlock;
+            unsigned int pos = blockOffsetBase[buk] + localCount[buk];
+            localCount[buk]++;
 
-        d_out[pos] = v;
+            d_out[pos] = v;
+        }
     }
 }
 
