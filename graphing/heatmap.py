@@ -2,6 +2,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 import os
+from matplotlib.colors import LogNorm
+
 
 def make_heatmap(data_matrix, items_thread, block_labels, title, filename):
     # Ensure heatmaps folder exists
@@ -16,8 +18,9 @@ def make_heatmap(data_matrix, items_thread, block_labels, title, filename):
         data_matrix,
         annot=True,
         fmt=".2f",
-        cmap="viridis",
+        cmap="RdYlGn_r",
         cbar=True,
+        norm=LogNorm(vmin=np.min(data_matrix), vmax=np.max(data_matrix)),
         # cbar_kws={"shrink": 0.8, "aspect": 30},
         linewidths=.5,
         annot_kws={"size": 12}  # number size inside tiles

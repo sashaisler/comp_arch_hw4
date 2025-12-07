@@ -1,57 +1,47 @@
 import matplotlib.pyplot as plt
 import os
+import numpy as np
+from matplotlib.ticker import MultipleLocator
 
 # -----------------------------
-#  SAVE FIGURE TO FOLDER
+#  PLOT ONE SUBPLOT
 # -----------------------------
-def save_plot(bit_size, folder="figures"):
-    filename="radix_" + str(bit_size) + "bit.png"
-    # Create folder if not exists
-    if not os.path.exists(folder):
-        os.makedirs(folder)
-    
-    # Full file path
-    path = os.path.join(folder, filename)
-    
-    # Save the figure
-    plt.savefig(path, dpi=300)  # 300 DPI = publication quality
-    print(f"Saved figure to: {path}")
+def plot_radix(ax, items_thread, block_128, block_256, block_512,
+               bit_size, y_min, y_max):
+    # Lines
+    ax.plot(items_thread, block_128, marker='o', markersize=8, linewidth=2,
+            label="128 threads/block (4 warps)")
+    ax.plot(items_thread, block_256, marker='o', markersize=8, linewidth=2,
+            label="256 threads/block (8 warps)")
+    ax.plot(items_thread, block_512, marker='o', markersize=8, linewidth=2,
+            label="512 threads/block (16 warps)")
 
-# -----------------------------
-#  PLOT
-# -----------------------------
-def plot_radix(items_thread, block_128, block_256, block_512, bit_size):
-    plt.figure(figsize=(8, 4.5))
-    plt.plot(items_thread, block_128, marker='o', markersize=8, linewidth=2,
-             label="128 threads/block (4 warps)")
-    plt.plot(items_thread, block_256, marker='o', markersize=8, linewidth=2,
-             label="256 threads/block (8 warps)")
-    plt.plot(items_thread, block_512, marker='o', markersize=8, linewidth=2,
-             label="512 threads/block (16 warps)")
+    # X axis
+    ax.set_xlim(left=0, right=max(items_thread) + 2)  # small padding on right
+    ax.set_xticks(items_thread)
+    ax.tick_params(axis='x', labelsize=12)
 
-    # Fix x-axis alignment
-    plt.xlim(left=0)
+    # Y axis: same limits for all subplots
+    ax.set_ylim(y_min, y_max)
 
-    plt.xticks(items_thread, fontsize=14)  # tick marks at exactly 1,2,3,4,5,6
-    plt.yticks(fontsize=14)
+    # major ticks: every 200, with labels
+    ax.yaxis.set_major_locator(MultipleLocator(200))
+    # minor ticks: every 100, no labels
+    ax.yaxis.set_minor_locator(MultipleLocator(100))
 
-    plt.xlabel("Items per Thread", fontsize=16, labelpad=10)
-    plt.ylabel("Runtime (ms)", fontsize=16, labelpad=10)
-    # plt.title(str(bit_size) + "-Bit Radix Sort Performance", fontsize=18)
+    ax.tick_params(axis='y', which='major', labelsize=12)
+    # grid on both major and minor ticks
+    ax.grid(True, which='both', linestyle='--', alpha=0.3)
 
-    plt.grid(True, linestyle="--", alpha=0.3)
-    plt.legend(fontsize=14, loc='upper right')
-    plt.tight_layout()
+    ax.set_xlabel("Items per Thread", fontsize=14)
+    ax.set_ylabel("Runtime (ms)", fontsize=14)
 
-    # Call the save function
-    save_plot(bit_size)
-
-    # Show the plot
-    # plt.show()
+    ax.set_title(f"{bit_size}-Bit Radix", fontsize=14)
+    ax.legend(fontsize=10, loc='upper right')
 
 
 # -----------------------------
-#  YOUR 8-BIT DATA
+#  DATA
 # -----------------------------
 items_thread = [2, 4, 8, 16, 32, 64]
 
@@ -67,7 +57,37 @@ block_128_2 = [1629.01, 953.16, 609.98, 444.64, 360.46, 320.72]
 block_256_2 = [1072.02, 729.35, 561.93, 479.29, 443.43, 433.02]
 block_512_2 = [1053.84, 884.49, 802.02, 761.29, 753.43, 768.06]
 
+# -----------------------------
+#  GLOBAL Y-LIMITS
+# -----------------------------
+all_vals_global = (
+    block_128_2 + block_256_2 + block_512_2 +
+    block_128_4 + block_256_4 + block_512_4 +
+    block_128_8 + block_256_8 + block_512_8
+)
 
-plot_radix(items_thread, block_128_8, block_256_8, block_512_8, 8)
-plot_radix(items_thread, block_128_4, block_256_4, block_512_4, 4)
-plot_radix(items_thread, block_128_2, block_256_2, block_512_2, 2)
+y_min = 0
+max_val = max(all_vals_global)
+# round up to next 200 and add a bit of headroom
+y_max = 200 * int((max_val + 199) // 200)
+
+# -----------------------------
+#  MAKE ONE FIGURE WITH 3 SUBPLOTS
+# -----------------------------
+fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharey=True)
+
+# left: 2-bit, middle: 4-bit, right: 8-bit
+plot_radix(axes[0], items_thread, block_128_2, block_256_2, block_512_2, 2, y_min, y_max)
+plot_radix(axes[1], items_thread, block_128_4, block_256_4, block_512_4, 4, y_min, y_max)
+plot_radix(axes[2], items_thread, block_128_8, block_256_8, block_512_8, 8, y_min, y_max)
+
+fig.tight_layout()
+
+# Save single combined figure
+folder = "figures"
+if not os.path.exists(folder):
+    os.makedirs(folder)
+outpath = os.path.join(folder, "radix_all_bits.png")
+fig.savefig(outpath, dpi=300)
+print(f"Saved figure to: {outpath}")
+# plt.show()  # uncomment to display interactively
