@@ -65,8 +65,16 @@ void radixSortCPU8bit(uint32_t *data, int n) {
     free(temp);
 }
 
-int main(void) {
-    const int N = 1 << 25; // 1M elements, same scale as GPU test if you want
+int main(int argc, char **argv) {
+    const int N = 1 << 29; // 268,435,456 elements (same as GPU version)
+
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <input_file>\n", argv[0]);
+        return 1;
+    }
+
+    const char *inputPath = argv[1];
+
     uint32_t *arr  = (uint32_t *)malloc(N * sizeof(uint32_t));
     uint32_t *copy = (uint32_t *)malloc(N * sizeof(uint32_t));
 
@@ -75,10 +83,27 @@ int main(void) {
         return 1;
     }
 
-    // Fill with pseudo-random data
-    for (int i = 0; i < N; ++i) {
-        arr[i] = (uint32_t)rand();
+    // Open and read N integers from the input text file (space/newline separated)
+    FILE *fin = fopen(inputPath, "r");
+    if (!fin) {
+        perror("Error opening input file");
+        free(arr);
+        free(copy);
+        return 1;
     }
+
+    for (int i = 0; i < N; ++i) {
+        if (fscanf(fin, "%u", &arr[i]) != 1) {
+            fprintf(stderr,
+                    "Error: input file '%s' contains fewer than %d integers (stopped at %d)\n",
+                    inputPath, N, i);
+            fclose(fin);
+            free(arr);
+            free(copy);
+            return 1;
+        }
+    }
+    fclose(fin);
 
     // Keep a copy if you want to compare with some other sort later
     memcpy(copy, arr, N * sizeof(uint32_t));
@@ -112,4 +137,3 @@ int main(void) {
 
     return 0;
 }
-
