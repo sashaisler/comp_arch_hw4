@@ -13,13 +13,9 @@
         }                                                                      \
     } while (0)
 
-#define BLOCK_SIZE 256          // threads per block
-#define ITEMS_PER_THREAD 4      // how many items each thread processes
-#define CHUNK_SIZE (BLOCK_SIZE * ITEMS_PER_THREAD)
-
-// ================= Kernel A: per-block histogram =================
-// Each block processes CHUNK_SIZE contiguous elements (except maybe last).
-// All threads in the block cooperatively build a shared histogram.
+// ======================================================================
+// Kernel A: per-block histogram in shared memory
+// ======================================================================
 
 __global__
 void buildBlockHistKernel(const uint32_t *d_in,
@@ -27,23 +23,25 @@ void buildBlockHistKernel(const uint32_t *d_in,
                           int shift,
                           unsigned int *d_blockHist,
                           size_t radix,
-                          uint32_t radixMask)
+                          uint32_t radixMask,
+                          int chunkSize)
 {
     extern __shared__ unsigned int s_hist[];
 
     int tid        = threadIdx.x;
     int blockId    = blockIdx.x;
-    int blockStart = blockId * CHUNK_SIZE;
-    int blockEnd   = blockStart + CHUNK_SIZE;
+    int blockStart = blockId * chunkSize;
+    int blockEnd   = blockStart + chunkSize;
+    if (blockStart >= n) return;
     if (blockEnd > n) blockEnd = n;
 
-    // Initialize shared histogram
+    // Zero per-block histogram
     for (size_t b = tid; b < radix; b += blockDim.x) {
         s_hist[b] = 0;
     }
     __syncthreads();
 
-    // Accumulate local histogram
+    // Build local histogram
     for (int idx = blockStart + tid; idx < blockEnd; idx += blockDim.x) {
         uint32_t v       = d_in[idx];
         unsigned int buk = (v >> shift) & radixMask;
@@ -51,20 +49,111 @@ void buildBlockHistKernel(const uint32_t *d_in,
     }
     __syncthreads();
 
-    // Write shared histogram to global memory
+    // Write to global memory: d_blockHist[blockId * radix + b]
     size_t base = (size_t)blockId * radix;
     for (size_t b = tid; b < radix; b += blockDim.x) {
         d_blockHist[base + b] = s_hist[b];
     }
 }
 
-// ================= Kernel B: parallel scatter per block =================
-// Each block scatters its CHUNK_SIZE elements into the correct positions.
-// We use per-block per-bucket base offsets (precomputed on host) plus
-// per-block shared counters so that *all* threads in the block can
-// scatter in parallel.
-// NOTE: This is NOT stable within a bucket anymore, but final numeric
-// order is correct (stability doesn't matter for plain integers).
+// ======================================================================
+// Kernel: reduce per-block histograms into global bucketTotals[b]
+// ======================================================================
+
+__global__
+void reduceBucketsKernel(const unsigned int *d_blockHist,
+                         unsigned int *d_bucketTotals,
+                         int numBlocks,
+                         size_t radix)
+{
+    size_t bucket = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bucket >= radix) return;
+
+    unsigned int sum = 0;
+    for (int blk = 0; blk < numBlocks; ++blk) {
+        sum += d_blockHist[(size_t)blk * radix + bucket];
+    }
+    d_bucketTotals[bucket] = sum;
+}
+
+// ======================================================================
+// Kernel: exclusive scan of bucketTotals -> bucketBase
+// Assumes radix is a power of two and <= maxThreadsPerBlock.
+// ======================================================================
+
+__global__
+void exclusiveScanKernel(const unsigned int *in,
+                         unsigned int *out,
+                         size_t n)
+{
+    extern __shared__ unsigned int temp[];
+
+    int thid = threadIdx.x;
+    if ((size_t)thid >= n) return;
+
+    temp[thid] = in[thid];
+
+    int offset = 1;
+
+    // upsweep
+    for (size_t d = n >> 1; d > 0; d >>= 1) {
+        __syncthreads();
+        if ((size_t)thid < d) {
+            int ai = offset * ((thid << 1) + 1) - 1;
+            int bi = offset * ((thid << 1) + 2) - 1;
+            temp[bi] += temp[ai];
+        }
+        offset <<= 1;
+    }
+
+    if (thid == 0) {
+        temp[n - 1] = 0;
+    }
+
+    // downsweep
+    for (size_t d = 1; d < n; d <<= 1) {
+        offset >>= 1;
+        __syncthreads();
+        if ((size_t)thid < d) {
+            int ai = offset * ((thid << 1) + 1) - 1;
+            int bi = offset * ((thid << 1) + 2) - 1;
+            unsigned int t = temp[ai];
+            temp[ai] = temp[bi];
+            temp[bi] += t;
+        }
+    }
+    __syncthreads();
+
+    out[thid] = temp[thid];
+}
+
+// ======================================================================
+// Kernel: compute per-block offsets from block hist + bucketBase
+// ======================================================================
+
+__global__
+void computeBlockOffsetsKernel(const unsigned int *d_blockHist,
+                               const unsigned int *d_bucketBase,
+                               unsigned int *d_blockOffsets,
+                               int numBlocks,
+                               size_t radix)
+{
+    size_t bucket = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bucket >= radix) return;
+
+    unsigned int running = d_bucketBase[bucket];
+
+    for (int blk = 0; blk < numBlocks; ++blk) {
+        size_t idx = (size_t)blk * radix + bucket;
+        unsigned int h = d_blockHist[idx];
+        d_blockOffsets[idx] = running;
+        running += h;
+    }
+}
+
+// ======================================================================
+// Kernel B: scatter using per-block offsets
+// ======================================================================
 
 __global__
 void scatterKernel(const uint32_t *d_in,
@@ -73,17 +162,19 @@ void scatterKernel(const uint32_t *d_in,
                    int shift,
                    const unsigned int *d_blockOffsets,
                    size_t radix,
-                   uint32_t radixMask)
+                   uint32_t radixMask,
+                   int chunkSize)
 {
     extern __shared__ unsigned int localCount[];
 
     int tid        = threadIdx.x;
     int blockId    = blockIdx.x;
-    int blockStart = blockId * CHUNK_SIZE;
-    int blockEnd   = blockStart + CHUNK_SIZE;
+    int blockStart = blockId * chunkSize;
+    int blockEnd   = blockStart + chunkSize;
+    if (blockStart >= n) return;
     if (blockEnd > n) blockEnd = n;
 
-    // Initialize per-block bucket counters cooperatively
+    // Zero per-block local counters
     for (size_t b = tid; b < radix; b += blockDim.x) {
         localCount[b] = 0;
     }
@@ -91,8 +182,7 @@ void scatterKernel(const uint32_t *d_in,
 
     const unsigned int *blockOffsetBase = d_blockOffsets + (size_t)blockId * radix;
 
-    // To keep the pass STABLE, we must process elements in block order.
-    // Let a single thread (tid == 0) walk [blockStart, blockEnd) in order.
+    // Stable scatter within this block
     if (tid == 0) {
         for (int idx = blockStart; idx < blockEnd; ++idx) {
             uint32_t v       = d_in[idx];
@@ -106,44 +196,55 @@ void scatterKernel(const uint32_t *d_in,
     }
 }
 
-// ================= Generic LSD radix sort =================
+// ======================================================================
+// Fully GPU-based LSD radix sort
+// ======================================================================
 
-void radixSortGPU(uint32_t *d_data, int n, int radixBits, float *elapsed_ms_out)
+void radixSortGPU(uint32_t *d_data,
+                  int n,
+                  int radixBits,
+                  int blockSize,
+                  int itemsPerThread,
+                  float *elapsed_ms_out)
 {
-    // Temporary array (ping-pong)
-    uint32_t *d_temp = NULL;
-    CUDA_CHECK(cudaMalloc(&d_temp, n * sizeof(uint32_t)));
-
-    // Number of blocks: each block handles CHUNK_SIZE elements
-    int numBlocks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
-    // Radix (number of buckets) for this run
-    size_t radix = (size_t)1 << radixBits;
-
-    // Per-block histograms and offsets (size: numBlocks * radix)
-    unsigned int *d_blockHist    = NULL;
-    unsigned int *d_blockOffsets = NULL;
-    CUDA_CHECK(cudaMalloc(&d_blockHist,    numBlocks * radix * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMalloc(&d_blockOffsets, numBlocks * radix * sizeof(unsigned int)));
-
-    // Host buffers for hist and offsets
-    unsigned int *h_blockHist    = (unsigned int*)malloc(numBlocks * radix * sizeof(unsigned int));
-    unsigned int *h_blockOffsets = (unsigned int*)malloc(numBlocks * radix * sizeof(unsigned int));
-    unsigned int *h_bucketTotals = (unsigned int*)malloc(radix * sizeof(unsigned int));
-    unsigned int *h_bucketBase   = (unsigned int*)malloc(radix * sizeof(unsigned int));
-
-    if (!h_blockHist || !h_blockOffsets || !h_bucketTotals || !h_bucketBase) {
-        fprintf(stderr, "Host malloc failed\n");
+    if (radixBits <= 0 || radixBits > 32 || (32 % radixBits) != 0) {
+        fprintf(stderr,
+            "Error: radixBits must be > 0, <= 32, and divide 32 (got %d)\n",
+            radixBits);
         exit(EXIT_FAILURE);
     }
 
-    // Timing events
-    cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-    CUDA_CHECK(cudaEventRecord(start, 0));
+    if (blockSize <= 0 || blockSize > 1024 || (blockSize % 32) != 0) {
+        fprintf(stderr,
+            "Error: blockSize must be > 0, <= 1024, and a multiple of 32 (got %d)\n",
+            blockSize);
+        exit(EXIT_FAILURE);
+    }
 
-    int numPasses = 32 / radixBits;
+    if (itemsPerThread <= 0) {
+        fprintf(stderr,
+            "Error: itemsPerThread must be > 0 (got %d)\n",
+            itemsPerThread);
+        exit(EXIT_FAILURE);
+    }
+
+    int chunkSize = blockSize * itemsPerThread;
+    if (chunkSize <= 0) {
+        fprintf(stderr, "Error: chunkSize overflow or invalid\n");
+        exit(EXIT_FAILURE);
+    }
+
+    size_t radix = (size_t)1 << radixBits;
+
+    int maxThreadsPerBlock = 1024;
+    if (radix > (size_t)maxThreadsPerBlock) {
+        fprintf(stderr,
+            "Error: radix (%zu) too large for simple single-block scan kernel.\n"
+            "Use smaller radixBits or implement a multi-block scan.\n",
+            radix);
+        exit(EXIT_FAILURE);
+    }
+
     uint32_t radixMask;
     if (radixBits == 32) {
         radixMask = 0xFFFFFFFFu;
@@ -151,67 +252,67 @@ void radixSortGPU(uint32_t *d_data, int n, int radixBits, float *elapsed_ms_out)
         radixMask = (uint32_t)(((uint64_t)1 << radixBits) - 1u);
     }
 
+    int numBlocks = (n + chunkSize - 1) / chunkSize;
+
+    uint32_t *d_temp = NULL;
+    CUDA_CHECK(cudaMalloc(&d_temp, n * sizeof(uint32_t)));
+
+    unsigned int *d_blockHist    = NULL;
+    unsigned int *d_blockOffsets = NULL;
+    unsigned int *d_bucketTotals = NULL;
+    unsigned int *d_bucketBase   = NULL;
+
+    CUDA_CHECK(cudaMalloc(&d_blockHist,    (size_t)numBlocks * radix * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_blockOffsets, (size_t)numBlocks * radix * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_bucketTotals, radix * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_bucketBase,   radix * sizeof(unsigned int)));
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start, 0));
+
+    int numPasses = 32 / radixBits;
     uint32_t *d_in  = d_data;
     uint32_t *d_out = d_temp;
 
     for (int pass = 0; pass < numPasses; ++pass) {
         int shift = pass * radixBits;
 
-        size_t shmemSize = radix * sizeof(unsigned int);
-
-        // 1) Build per-block histograms on GPU
-        buildBlockHistKernel<<<numBlocks, BLOCK_SIZE, shmemSize>>>(
-            d_in, n, shift, d_blockHist, radix, radixMask
+        size_t shmem_hist = radix * sizeof(unsigned int);
+        buildBlockHistKernel<<<numBlocks, blockSize, shmem_hist>>>(
+            d_in, n, shift, d_blockHist, radix, radixMask, chunkSize
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // 2) Copy per-block histograms to host
-        CUDA_CHECK(cudaMemcpy(h_blockHist, d_blockHist,
-                              numBlocks * radix * sizeof(unsigned int),
-                              cudaMemcpyDeviceToHost));
-
-        // 3) Compute total counts per bucket
-        for (size_t b = 0; b < radix; ++b) {
-            h_bucketTotals[b] = 0;
-        }
-        for (int blk = 0; blk < numBlocks; ++blk) {
-            size_t base = (size_t)blk * radix;
-            for (size_t b = 0; b < radix; ++b) {
-                h_bucketTotals[b] += h_blockHist[base + b];
-            }
-        }
-
-        // 4) Compute global bucket bases (exclusive prefix sum on buckets)
-        unsigned int sum = 0;
-        for (size_t b = 0; b < radix; ++b) {
-            h_bucketBase[b] = sum;
-            sum += h_bucketTotals[b];
-        }
-
-        // 5) Compute per-block offsets for each bucket
-        for (size_t b = 0; b < radix; ++b) {
-            unsigned int running = h_bucketBase[b];
-            for (int blk = 0; blk < numBlocks; ++blk) {
-                size_t idx = (size_t)blk * radix + b;
-                h_blockOffsets[idx] = running;
-                running += h_blockHist[idx];
-            }
-        }
-
-        // 6) Copy per-block offsets back to device
-        CUDA_CHECK(cudaMemcpy(d_blockOffsets, h_blockOffsets,
-                              numBlocks * radix * sizeof(unsigned int),
-                              cudaMemcpyHostToDevice));
-
-        // 7) Scatter into temp buffer in parallel
-        scatterKernel<<<numBlocks, BLOCK_SIZE, shmemSize>>>(
-            d_in, d_out, n, shift, d_blockOffsets, radix, radixMask
+        int threadsBuckets = 256;
+        int blocksBuckets  = (int)((radix + threadsBuckets - 1) / threadsBuckets);
+        reduceBucketsKernel<<<blocksBuckets, threadsBuckets>>>(
+            d_blockHist, d_bucketTotals, numBlocks, radix
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // 8) Swap d_in and d_out for next pass
+        exclusiveScanKernel<<<1, (int)radix, radix * sizeof(unsigned int)>>>(
+            d_bucketTotals, d_bucketBase, radix
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        computeBlockOffsetsKernel<<<blocksBuckets, threadsBuckets>>>(
+            d_blockHist, d_bucketBase, d_blockOffsets, numBlocks, radix
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        size_t shmem_scatter = radix * sizeof(unsigned int);
+        scatterKernel<<<numBlocks, blockSize, shmem_scatter>>>(
+            d_in, d_out, n, shift, d_blockOffsets, radix, radixMask, chunkSize
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
         uint32_t *tmp = d_in;
         d_in  = d_out;
         d_out = tmp;
@@ -219,6 +320,7 @@ void radixSortGPU(uint32_t *d_data, int n, int radixBits, float *elapsed_ms_out)
 
     CUDA_CHECK(cudaEventRecord(stop, 0));
     CUDA_CHECK(cudaEventSynchronize(stop));
+
     float elapsed_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
     if (elapsed_ms_out) *elapsed_ms_out = elapsed_ms;
@@ -226,37 +328,39 @@ void radixSortGPU(uint32_t *d_data, int n, int radixBits, float *elapsed_ms_out)
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
 
-    // If the final sorted data ended up in the temp buffer, copy it back
     if (d_in != d_data) {
         CUDA_CHECK(cudaMemcpy(d_data, d_in, n * sizeof(uint32_t),
                               cudaMemcpyDeviceToDevice));
     }
 
-    // Free temporary GPU memory
     CUDA_CHECK(cudaFree(d_temp));
     CUDA_CHECK(cudaFree(d_blockHist));
     CUDA_CHECK(cudaFree(d_blockOffsets));
-
-    free(h_blockHist);
-    free(h_blockOffsets);
-    free(h_bucketTotals);
-    free(h_bucketBase);
+    CUDA_CHECK(cudaFree(d_bucketTotals));
+    CUDA_CHECK(cudaFree(d_bucketBase));
 }
 
-// ============================= main =============================
+// ======================================================================
+// main
+// Usage: ./prog <radix_bits> <block_size> <items_per_thread> <input_file>
+// ======================================================================
 
 int main(int argc, char **argv)
 {
-    const int N = 1 << 28; // 33,554,432 elements
+    const int N = 1 << 29; // 268,435,456 elements
 
-    if (argc != 3) {
+    if (argc != 5) {
         fprintf(stderr,
-                "Usage: %s <radix_bits> <input_file>\n", argv[0]);
+                "Usage: %s <radix_bits> <block_size> <items_per_thread> <input_file>\n",
+                argv[0]);
         return 1;
     }
 
-    int radixBits = atoi(argv[1]);
-    // Allow any radixBits in [1, 32] as long as it divides 32
+    int radixBits      = atoi(argv[1]);
+    int blockSize      = atoi(argv[2]);
+    int itemsPerThread = atoi(argv[3]);
+    const char *inputPath = argv[4];
+
     if (radixBits <= 0 || radixBits > 32 || (32 % radixBits) != 0) {
         fprintf(stderr,
                 "Error: radix_bits must be > 0, <= 32, and divide 32 (got %d)\n",
@@ -264,7 +368,19 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    const char *inputPath = argv[2];
+    if (blockSize <= 0 || blockSize > 1024 || (blockSize % 32) != 0) {
+        fprintf(stderr,
+                "Error: block_size must be > 0, <= 1024, and a multiple of 32 (got %d)\n",
+                blockSize);
+        return 1;
+    }
+
+    if (itemsPerThread <= 0) {
+        fprintf(stderr,
+                "Error: items_per_thread must be > 0 (got %d)\n",
+                itemsPerThread);
+        return 1;
+    }
 
     uint32_t *h_in  = (uint32_t*)malloc(N * sizeof(uint32_t));
     uint32_t *h_out = (uint32_t*)malloc(N * sizeof(uint32_t));
@@ -273,7 +389,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // Read N integers from the input text file (space/newline separated)
     FILE *fin = fopen(inputPath, "r");
     if (!fin) {
         perror("Error opening input file");
@@ -293,7 +408,6 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-
     fclose(fin);
 
     uint32_t *d_data = NULL;
@@ -302,12 +416,11 @@ int main(int argc, char **argv)
                           cudaMemcpyHostToDevice));
 
     float elapsed_ms = 0.0f;
-    radixSortGPU(d_data, N, radixBits, &elapsed_ms);
+    radixSortGPU(d_data, N, radixBits, blockSize, itemsPerThread, &elapsed_ms);
 
-    printf("GPU radix sort time (%d-bit passes): %.3f ms\n",
-           radixBits, elapsed_ms);
+    printf("GPU radix sort time (%d-bit passes, blockSize=%d, itemsPerThread=%d): %.3f ms\n",
+           radixBits, blockSize, itemsPerThread, elapsed_ms);
 
-    // Copy back result to host and verify
     CUDA_CHECK(cudaMemcpy(h_out, d_data, N * sizeof(uint32_t),
                           cudaMemcpyDeviceToHost));
 
@@ -332,4 +445,3 @@ int main(int argc, char **argv)
 
     return 0;
 }
-
